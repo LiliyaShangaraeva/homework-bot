@@ -7,17 +7,9 @@ from http import HTTPStatus
 import requests
 from dotenv import load_dotenv
 from telebot import TeleBot
+from telebot.apihelper import ApiException
 
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-    ]
-)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
 
@@ -36,25 +28,9 @@ HOMEWORK_VERDICTS = {
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
 
-last_error_message = None
 
-
-def send_error_to_telegram(bot, error_message):
-    """Отправляет сообщение об ошибке в Telegram."""
-    global last_error_message
-    if last_error_message == error_message:
-        return
-    try:
-        bot.send_message(chat_id=TELEGRAM_CHAT_ID,
-                         text=f'Ошибка: {error_message}')
-        logger.info(
-            f'Сообщение об ошибке отправлено в Telegram: {error_message}'
-        )
-        last_error_message = error_message
-    except Exception as error:
-        logger.error(
-            f'Не удалось отправить сообщение об ошибке в Telegram: {error}'
-        )
+class ApiError(Exception):
+    """Ошибка при работетс API."""
 
 
 def check_tokens():
@@ -64,60 +40,70 @@ def check_tokens():
         'TELEGRAM_TOKEN': TELEGRAM_TOKEN,
         'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID
     }
+    error_tokens = []
     for name, value in tokens.items():
         if not value:
-            logger.critical(
-                f"Отсутствует обязательная переменная окружения:'{name}'. "
-                "Программа принудительно остановлена."
-            )
-            return False
+            error_tokens.append(name)
+    if error_tokens:
+        message = (
+            "Отсутствуют обязательные переменные окружения: "
+            f"{error_tokens}. Программа принудительно остановлена."
+        )
+        logger.critical(message)
+        raise SystemExit(message)
     return True
 
 
 def send_message(bot, message):
     """Отправляет сообщение в Telegram."""
     try:
+        logger.debug(f'Начало отправки сообщения: {message}')
         bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
         logger.debug(f'Сообщение отправлено: {message}')
-    except Exception as error:
+        return True
+    except (ApiException, requests.RequestException) as error:
         logger.error(f'Ошибка при отправке сообщения: {error}')
+        return False
 
 
 def get_api_answer(timestamp):
     """Делает запрос к эндпоинту API-сервиса."""
     payload = {'from_date': timestamp}
+    logger.info(f'Запрос к API: {ENDPOINT} с from_date={timestamp}')
 
     try:
-        logger.info(f'Запрос к API: {ENDPOINT} с from_date={timestamp}')
         response = requests.get(ENDPOINT, headers=HEADERS, params=payload)
-        if response.status_code != HTTPStatus.OK:
-            raise Exception(
-                f'Запрос к API завершился с кодом {response.status_code}'
-            )
-        return response.json()
     except requests.RequestException as error:
-        logger.error(f'Ошибка при запросе к API: {error}')
-        return None
+        raise ApiError(f'Ошибка при запросе к API: {error}')
+    if response.status_code != HTTPStatus.OK:
+        raise ApiError(
+            f'Запрос к API завершился с кодом {response.status_code}'
+        )
+    try:
+        return response.json()
+    except ValueError as error:
+        raise ApiError(f'Ошибка парсинга JSON: {error}')
 
 
 def check_response(response):
     """Проверяет ответ API на соответствие документации."""
     if not isinstance(response, dict):
-        raise TypeError('Ответ API не является словарём.')
+        raise TypeError(
+            'Ответ API не является словарём. '
+            f'Получено: {type(response).__name__}'
+        )
     if 'homeworks' not in response:
         raise KeyError('Отсутствует ключ "homeworks".')
 
     homeworks = response['homeworks']
 
     if not isinstance(homeworks, list):
-        raise TypeError('Значение "homeworks" не является списком.')
-    if not homeworks:
-        logger.debug('Нет новых домашних работ.')
-        return None
-    if not isinstance(homeworks[0], dict):
-        raise TypeError('Первая домашняя работа не является словарём.')
+        raise TypeError(
+            'Значение "homeworks" не является списком.'
+            f'Получено: {type(homeworks).__name__}'
+        )
 
-    return homeworks[0]
+    return homeworks
 
 
 def parse_status(homework):
@@ -137,29 +123,48 @@ def parse_status(homework):
 def main():
     """Основная логика работы бота."""
     logger.info('Бот запущен.')
-    if not check_tokens():
-        exit()
+    check_tokens()
     bot = TeleBot(token=TELEGRAM_TOKEN)
     timestamp = int(time.time())
+    last_error_message = None
 
     while True:
         try:
             response = get_api_answer(timestamp)
-            homework = check_response(response)
-            if homework is not None:
-                message = parse_status(homework)
-                send_message(bot, message)
-            if 'current_date' in response:
-                timestamp = response['current_date']
+            homeworks = check_response(response)
+            if homeworks is not None:
+                for homework in homeworks:
+                    message = parse_status(homework)
+                    if send_message(bot, message):
+                        timestamp = response.get('current_date', timestamp)
+                        last_error_message = None
             logger.debug(f'Новый запрос через {RETRY_PERIOD} секунд.')
-            time.sleep(RETRY_PERIOD)
 
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
             logger.error(message)
-            send_error_to_telegram(bot, message)
+            if last_error_message != str(error):
+                send_message(bot, message)
+                logger.info(
+                    f'Сообщение об ошибке отправлено в Telegram: {error}'
+                )
+                last_error_message = str(error)
+            else:
+                logger.warning(
+                    'Не удалось отправить сообщение об ошибке в Telegram.'
+                )
+        finally:
             time.sleep(RETRY_PERIOD)
 
 
 if __name__ == '__main__':
+
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+        ]
+    )
+
     main()
