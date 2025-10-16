@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 from telebot import TeleBot
 from telebot.apihelper import ApiException
 
+from exeptions import ApiError, TokenError
+
 logger = logging.getLogger(__name__)
 load_dotenv()
 
@@ -29,10 +31,6 @@ HOMEWORK_VERDICTS = {
 }
 
 
-class ApiError(Exception):
-    """Ошибка при работетс API."""
-
-
 def check_tokens():
     """Проверяет доступность переменных окружения."""
     tokens = {
@@ -50,8 +48,7 @@ def check_tokens():
             f"{error_tokens}. Программа принудительно остановлена."
         )
         logger.critical(message)
-        raise SystemExit(message)
-    return True
+        raise TokenError(message)
 
 
 def send_message(bot, message):
@@ -132,13 +129,11 @@ def main():
         try:
             response = get_api_answer(timestamp)
             homeworks = check_response(response)
-            if homeworks is not None:
-                for homework in homeworks:
-                    message = parse_status(homework)
-                    if send_message(bot, message):
-                        timestamp = response.get('current_date', timestamp)
-                        last_error_message = None
-            logger.debug(f'Новый запрос через {RETRY_PERIOD} секунд.')
+            if homeworks:
+                message = parse_status(homeworks[0])
+                if send_message(bot, message):
+                    timestamp = response.get('current_date', timestamp)
+                    last_error_message = None
 
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
@@ -149,11 +144,9 @@ def main():
                     f'Сообщение об ошибке отправлено в Telegram: {error}'
                 )
                 last_error_message = str(error)
-            else:
-                logger.warning(
-                    'Не удалось отправить сообщение об ошибке в Telegram.'
-                )
+
         finally:
+            logger.debug(f'Новый запрос через {RETRY_PERIOD} секунд.')
             time.sleep(RETRY_PERIOD)
 
 
